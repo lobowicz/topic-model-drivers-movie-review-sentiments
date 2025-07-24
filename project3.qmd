@@ -1,0 +1,491 @@
+---
+title: "Topic Modeling Drivers of Movie Review Sentiments"
+author: Parisa Mershon, Joseph Lobowicz
+format: 
+  pdf: default
+  html:
+    anchor-sections: true
+    code-tools: false
+    code-link: true
+    embed-resources: true
+    link-external-icon: true
+    link-external-newwindow: true
+    number-sections: true
+    smooth-scroll: true
+    toc: true
+editor: visual
+---
+
+```{r}
+#| echo: false
+#| warnings: false
+#| include: false
+
+if (interactive()) {
+  rstudioapi::restartSession(clean = TRUE)
+}
+```
+
+```{r}
+#| include: false
+#| label: get-packages
+
+packages <- c(
+  "tidyverse", "tidymodels", "textrecipes", "kknn",
+  "xgboost", "glmnet", "corrplot", "parallel", "future",
+  "textdata", "stm", "topicmodels", "tidytext", "reshape2",
+  "ldatuning", "tm", "glue", "dplyr"
+)
+
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+}
+
+for (pkg in packages) {
+  library(pkg, character.only = TRUE)
+}
+
+set.seed(123)
+
+all_cores <- parallel::detectCores()
+plan(multisession, workers = all_cores)
+```
+
+## So What?
+
+In this project, we apply latent Dirichlet allocation topic modeling to a corpus of IMDB movie reviews to uncover the themes that drive positive and negative sentiment. Next, we select an optimal number of topics via perplexity, log‑likelihood, and coherence criteria. We then interpret the resulting topics, compare their prevalence across sentiment groups, and build a gradient boosted tree classifier to predict sentiment from topic proportions.
+
+Ultimately, we want to identify the latent themes (topics) that distinguish positive ("pos") vs negative ("neg") reviews in the IMDB dataset. By uncovering these topics, we can understand what aspects of a film drive audience praise or criticism, and then evaluate whether these topic features can predict sentiment.
+
+## Exploratory Data Analysis 
+
+Before diving into topic modeling, we explore the raw distribution of ratings and review lengths in our IMDB dataset to understand potential biases and how they may influence downstream analyses.
+
+To begin, we tally the counts of each rating by sentiment label and plot them (see @fig-rat-dis).
+
+```{r}
+#| include: false
+#| message: false
+
+imdb_raw <- read_csv("../data/imdb_reviews_no_html.csv",
+  show_col_types = FALSE
+) #|>
+# sort(rating)
+
+imdb_clean <- imdb_raw |>
+  mutate(
+    rating = factor(rating),
+    sentiment = case_when(
+      sentiment %in% "pos" ~ "Positive",
+      sentiment %in% "neg" ~ "Negative"
+    )
+  ) |>
+  select(id, rating, sentiment, split, text) |>
+  arrange(rating)
+
+imdb <- imdb_clean |>
+  unnest_tokens(word, text)
+
+imdb_reviews <- imdb_clean |>
+  count(rating, sentiment)
+```
+
+```{r}
+#| label: fig-rat-dis
+#| echo: false
+
+imdb_reviews |>
+  ggplot(aes(rating, n)) +
+  theme(legend.position = "none") +
+  geom_col(aes(fill = sentiment), alpha = 0.8) +
+  labs(
+    title = "Distribution of Ratings",
+    x = "Rating",
+    y = "Count",
+    subtitle = "Supplementary Data Exploration Figure",
+    caption = "Counts per each rating in the dataset for movie reviews",
+    fill = "Rating"
+  ) +
+  scale_color_gradient(
+    low = "#FF6961",
+    high = "#40e0d0"
+  ) +
+  geom_vline(xintercept = 4.5, col = "black", lwd = 1, linetype = 2)
+```
+- Rating 1 dominates the negative reviews with 5,022 observations, while Ratings 2–4 each contribute roughly 2,300–2,600 negatives.
+- On the positive side, Rating 10 peaks at 2,971, with Ratings 7–9 trailing between 1,378 and 1,731.
+
+This U‑shaped curve indicates that reviewers seldom choose middle scores, opting instead for strong approval or disapproval. For topic modeling later, this means that thematic signals may be most pronounced at the extremes. 
+Next, we inspect how review length varies across star ratings by plotting word‐count distributions (see @fig-rev-len).
+
+```{r}
+#| label: fig-rev-len
+#| echo: false
+
+words_per_review <- imdb |>
+  count(id, sentiment, rating) |>
+  mutate(proportion = n / mean(n)) |>
+  filter(proportion < 2.5)
+
+words_per_review |>
+  ggplot(
+    aes(fct_reorder(rating, as.numeric(rating)),
+      n,
+      color = as.numeric(rating)
+    )
+  ) +
+  theme(legend.position = "none") +
+  geom_jitter(alpha = .1, size = .5) +
+  geom_boxplot() +
+  scale_color_gradient(
+    low = "#FF6961",
+    high = "#40e0d0"
+  ) +
+  geom_vline(xintercept = 4.5, col = "black", lwd = 1, linetype = 2) +
+  labs(
+    title = "Review Length Across Ratings",
+    x = "Rating",
+    y = "Count"
+  )
+```
+- Ratings 4 and 7 show the highest median word counts, suggesting that "middle" reviews tend to be more wordy.
+- Extremes (1 and 10) yield the shortest comments, implying that strongly felt opinions may be conveyed more briefly.
+
+Longer, midrange reviews may blend positive and negative terms, potentially creating topic mixtures that challenge clean separation. In contrast, shorter extreme reviews might contain only a few key sentiment words, skewing topic proportions toward dominant themes. 
+
+## Clean Up
+
+The dataset comprises 50,000 labeled reviews evenly split between training and testing. In order to save time running models, we will use only the rows with `split = train`. This subset contains 25,000 reviews. We remove all `<br /><br />` tags to avoid spurious tokens, then tokenize and drop stop words. The resulting tokens feed into a sparse document–term matrix for the training subset. This preprocessing ensures our topic models focus on terms without HTML noise.
+
+```{r}
+#| include: false
+
+# import the dataset
+reviews <- read_csv("../data/imdb_reviews.csv")
+
+# text observations have html tags so replace with a space
+reviews_clean <- reviews |>
+  mutate(text = str_replace_all(text, "<br /><br />", " "))
+
+# let's first count how many test and train rows we have
+reviews_clean |>
+  count(split) # even split of test and train, 25000 each
+
+# work with train data only in case we do some supervised modeling
+reviews_train <- reviews_clean |>
+  filter(split == "train")
+# store test data
+reviews_test <- reviews_clean |>
+  filter(split == "test")
+```
+
+```{r}
+#| include: false
+
+# PLAN FOR PROJECT
+
+# 1. Find the different topics in the reviews
+# 2. Use Coherence, Perplexity, Log-likelihood to determine the best k value
+# 3. Illustrate the top words for each topic
+# 4a. Determine the proportion of topics for each sentiment (pos/neg)
+# 4b. Then pull out which topics are more frequently discussed for both pos/neg reviews
+# 5. See if we can build a model using the topics in a review and predict if it's a pos/neg sentiment
+```
+
+```{r}
+#| include: false
+
+# tokenize and remove stop words
+token_train <- reviews_train |>
+  select(id, text) |>
+  unnest_tokens(word, text) |>
+  anti_join(stop_words, by = "word")
+
+# build a DTM for the training data
+reviews_dtm <- token_train |>
+  count(id, word) |>
+  cast_dtm(document = id, term = word, value = n)
+
+reviews_dtm
+```
+
+## Number of Topics
+
+Having characterized basic corpus properties, we apply LDA to the training split’s document–term matrix. To choose the number of topics, we fit LDA models for `k = 5, 10, 15`, and compute both perplexity/log‑likelihood and four coherence metrics as shown below. 
+
+```{r}
+#| label: q-perp-log
+#| echo: false
+
+k_values <- seq(5, 15, by = 5)
+
+model_metrics <- map(k_values, function(k) {
+  lda_model <- LDA(
+    reviews_dtm,
+    method = "Gibbs",
+    k = k,
+    control = list(seed = 123)
+  )
+  tibble(
+    k = k,
+    perplexity = perplexity(lda_model, reviews_dtm),
+    log_likelihood = as.numeric(logLik(lda_model))
+  )
+}) |>
+  list_rbind()
+
+model_metrics
+```
+
+```{r}
+#| label: q-coherence-plot
+#| echo: false
+
+coherence_result <- FindTopicsNumber(
+  reviews_dtm,
+  topics = k_values,
+  metrics = c("CaoJuan2009", "Arun2010", "Griffiths2004", "Deveaud2014"),
+  method = "Gibbs",
+  control = list(seed = 123)
+)
+
+FindTopicsNumber_plot(coherence_result)
+```
+
+Perplexity steadily decreases while log‑likelihood increases with k, but coherence peaks at ten topics balances the maximization and minimization of factors the best. So we select the optimal value of `k` to be 10. 
+
+## Final Model & Top Terms Per Topic
+
+Based on these diagnostics, we fix `k = 10` and refit the final LDA model. Its top ten terms per topic, as shown in @fig-final-top-terms, form coherent clusters that we can label descriptively. 
+
+```{r}
+#| label: q-final-model
+#| include: false
+
+# we fit our model using the best k value
+k_best <- 10
+lda_best <- LDA(
+  reviews_dtm,
+  method = "Gibbs",
+  k = k_best,
+  control = list(seed = 123)
+)
+```
+
+```{r, fig.width=14, fig.height=10, fig.pos="H"}
+#| label: fig-final-top-terms
+#| echo: false
+
+lda_best |>
+  tidy(matrix = "beta") |>
+  group_by(topic) |>
+  slice_max(beta, n = 10) |>
+  ungroup() |>
+  mutate(term = reorder_within(term, beta, topic)) |>
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~topic, scales = "free") +
+  scale_y_reordered() +
+  labs(title = glue("Top Terms per Topic (k = {k_best})"))
+```
+
+Some topics stick out as standout themes: Topic 2 collects strongly negative performance adjectives (“bad”, “boring”, “awful”), while Topic 3 captures horror‑genre language (“horror”, “killer”, “gore”). Topics 5 and 7 both reference “film” and “director” but diverge into aesthetic critique (“beautiful”, “style”) versus character analysis (“character”, “actors”). These coherent term sets allow clear thematic labels. Consider,
+
+- Topic 1: Social & Human Issues (world, war, history, life, human)
+- Topic 2: Performance Critique (bad, acting, boring, script, plot, poor)
+- Topic 3: Horror (dead, killer, night, blood, gore)
+- Topic 4: Family/Relationships (life, mother, wife, love, family, girl)
+- Topic 5: Art & Cinematography
+- Topic 8: TV Series
+- Topic 9: Action
+- Topic 10: Casting & Roles
+
+## Topic Proportions 
+
+For each topic, compute its average prevalence in positive vs. negative reviews to see which themes drive praise and criticism.
+
+```{r}
+#| label: fig-sent-avg-topic-prev
+#| echo: false
+
+doc_topics <- tidy(lda_best, matrix = "gamma") |>
+  mutate(id = as.integer(document))
+
+# compute the average gamma by sentiment and topic
+doc_topics |>
+  left_join(reviews_train |> select(id, sentiment), by = "id") |>
+  group_by(sentiment, topic) |>
+  summarize(mean_gamma = mean(gamma), .groups = "drop") |>
+  ggplot(aes(x = factor(topic), y = mean_gamma, fill = sentiment)) +
+  geom_col(position = "dodge", alpha = 0.7) +
+  labs(
+    title = "Average Topic Prevalence by Sentiment",
+    x     = "Topic",
+    y     = "Mean Gamma"
+  ) +
+  theme_minimal()
+```
+
+From @fig-sent-avg-topic-prev, we can see that that Topic 2 (Performance Critique) and Topic 3 (Horror) dominate negative reviews, whereas Topic 10 (Casting & Roles) and Topic 5 (Art & Cinematography) prevail in positive reviews. These themes are what reviewers mostly criticize for either sentiment, and could highlight which themes underlie praise and criticism.
+
+```{r}
+#| include: false
+#| warning: false
+
+# 1. Print the average gamma table for reference
+doc_topics |>
+  left_join(reviews_train |> select(id, sentiment), by = "id") |>
+  group_by(sentiment, topic) |>
+  summarize(mean_gamma = mean(gamma), .groups = "drop") |>
+  # treat topic as a factor for plotting
+  mutate(topic = factor(topic)) |>
+  ggplot(aes(
+    x    = reorder_within(topic, mean_gamma, sentiment),
+    y    = mean_gamma,
+    fill = sentiment
+  )) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_x") +
+  scale_x_reordered() +
+  coord_flip() +
+  labs(
+    title = "Topic Prevalence Ordered by Sentiment Group",
+    x     = "Topic (ordered by descending mean γ)",
+    y     = "Average Topic Proportion (γ)"
+  ) +
+  theme_minimal()
+
+# In the **neg** facet, Topic 2 (Performance Critique) has the highest mean γ, followed by Topic 3 (Horror & Gore), indicating these themes dominate negative reviews.
+# In the **pos** facet, Topic 10 (Casting & Roles) and Topic 5 (Art & Cinematography) lead, suggesting those are the most praised aspects in positive reviews.
+
+# These ordered bar charts make it easy to see, at a glance, which topics reviewers talk about most when they’re happy versus when they’re unhappy. We’ll refer back to these dominance patterns in our write‑up to explain *“so what?”* — namely, what thematic elements drive praise or criticism.
+```
+
+## Predictive Modeling with Topic Features (xgboost)
+
+Our goal for this section is to use each review’s topic proportions as features to predict whether it’s a positive review (otherwise, a negative one). We trained a gradient boosted tree model because it can capture non‑linear interactions among topics and is robust to multicollinearity in our topic‑proportion features.
+
+NB: We convert sentiment to factor 1 if sentiment is positive, and 0 if sentiment is negative.
+
+```{r}
+#| include: false
+
+# implement a gradient‑boosted tree classifier over the topic proportions, using cross‑validated tuning and ROC‑AUC as our selection metric.
+
+# pivot wider first
+topics_wide <- doc_topics |>
+  select(id, topic, gamma) |>
+  left_join(reviews_train |> select(id, sentiment), by = "id") |>
+  pivot_wider(
+    names_from = topic,
+    values_from = gamma,
+    names_prefix = "topic_"
+  ) |>
+  mutate(
+    # encode sentiment: 1 = positive, 0 = negative
+    sentiment = if_else(sentiment == "pos", 1L, 0L),
+    # convert to factor 0/1 for classification
+    sentiment = factor(sentiment, levels = c(0L, 1L))
+  )
+
+split <- initial_split(topics_wide, prop = 0.8, strata = sentiment)
+train_df <- training(split)
+test_df <- testing(split)
+
+# create recipe
+xgb_recipe <- recipe(sentiment ~ ., data = train_df) |>
+  step_rm(id)
+
+# specify model
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune()
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+# build the workflow
+xgb_wf <- workflow() |>
+  add_recipe(xgb_recipe) |>
+  add_model(xgb_spec)
+
+# 10‑fold cross‑validation on the training set
+folds <- vfold_cv(train_df, v = 10, strata = sentiment)
+
+# tuning grid
+xgb_params <- extract_parameter_set_dials(xgb_wf)
+xgb_grid <- grid_space_filling(xgb_params, size = 20)
+```
+
+```{r}
+#| include: false
+
+# tune hyperparameters using ROC‑AUC
+tune_res <- xgb_wf |>
+  tune_grid(
+    resamples = folds,
+    grid = xgb_grid,
+    metrics = metric_set(roc_auc, accuracy),
+    control = control_grid(save_pred = TRUE)
+  )
+
+# finalize the workflow with the best ROC‑AUC parameters
+best_params <- select_best(tune_res, metric = "roc_auc")
+final_wf <- finalize_workflow(xgb_wf, best_params)
+final_fit <- fit(final_wf, data = train_df)
+
+# make predictions on the test set
+test_results <- final_fit |>
+  predict(test_df, type = "prob") |>
+  bind_cols(predict(final_fit, test_df, type = "class")) |>
+  bind_cols(test_df)
+```
+
+```{r}
+#| echo: false
+#| label: fig-importance
+
+# extract and display feature importance
+xgb_obj <- extract_fit_engine(final_fit)
+xgb.importance(model = xgb_obj)
+```
+
+From the results above, we see that Topic 2 (“Performance Critique”) dominates with nearly 80% of total gain, indicating that words like *bad*, *acting*, *plot*, *boring*, *script* are by far the strongest predictors of a review’s sentiment. The next most important topics are Topic 3 (Horror) and Topic 1 (Social & Human Issues), accounting for under 5% of gain.
+
+```{r}
+#| echo: false
+#| label: conf-matrix
+
+# evaluate on test set
+test_results |> conf_mat(truth = sentiment, estimate = .pred_class)
+```
+From the confusion matrix, 76.64% are true negatives, and 83.52% are true positives. The model slightly under-predicts negative reviews (584 false positives) and under‑predicts positive reviews (412 false negatives). 
+
+```{r}
+#| echo: false
+
+# get accuracy
+test_results |> accuracy(truth = sentiment, estimate = .pred_class)
+```
+
+```{r}
+#| echo: false
+
+# which sentiment does the model do a better job predicting
+test_results |> roc_auc(truth = sentiment, .pred_1, event_level = "second")
+```
+An AUC of 0.873 tells us that our topic‑based GBT model has strong discriminative power. If we randomly pick one positive review and one negative review, there’s about an 87% chance the model will assign a higher “positive” probability to the actual positive one. Our topics capture most of the signal needed to tell praise from criticism. Combined with ~80% accuracy, the AUC shows the model is confident and correct across the full spectrum of review.
+
+Using non‑linear GBTs over topic proportions yields a good sentiment predictor that underlines that “Performance Critique” (Topic 2) and the other top topics truly drive the positive/negative split.
+
+## Conclusion
+
+In summary, our unsupervised topic model finds coherent themes that characterize and predict sentiment in movie reviews. The prominence of performance critique in negative reviews and casting/artistic topics in positive ones provides actionable insight into reviewers’ priorities. By coupling interpretable topics with a robust classifier, we reveal both the language patterns that drive audience reactions and the feasibility of sentiment prediction based solely on thematic content.
+
+
+
